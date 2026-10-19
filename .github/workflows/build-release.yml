@@ -1,0 +1,223 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git Ref or Tag to build (编译的 Tag 或分支，例如 v1.3.18.6，留空为当前分支)'
+        type: string
+        default: ''
+      publish_release:
+        description: 'Publish assets to GitHub Releases (发布到 GitHub Releases)'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release Tag (发布标签版本，留空则自动按ref或日期生成)'
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark as Pre-release (标记为预发布版本)'
+        type: boolean
+        default: false
+      draft:
+        description: 'Create draft release (创建为草稿发布)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            arch: x64
+            archive_name: Aseprite-Windows-x64.zip
+          - os: macos-latest
+            platform: macos
+            arch: arm64
+            archive_name: Aseprite-macOS-arm64.zip
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+            archive_name: Aseprite-Linux-x64.tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
+            libfontconfig1-dev
+
+      - name: Setup Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Resolve Skia Info
+        id: skia-info
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            this_dir=$(cygpath "${{ github.workspace }}")
+          else
+            this_dir="${{ github.workspace }}"
+          fi
+          skia_url=$(source "$this_dir/laf/misc/skia-url.sh" release ${{ matrix.platform }} ${{ matrix.arch }} | xargs)
+          skia_tag=$(cat "$this_dir/laf/misc/skia-tag.txt" | xargs)
+          echo "url=$skia_url" >> $GITHUB_OUTPUT
+          echo "tag=$skia_tag" >> $GITHUB_OUTPUT
+
+      - name: Cache Skia
+        id: cache-skia
+        uses: actions/cache@v4
+        with:
+          path: skia
+          key: skia-${{ matrix.platform }}-${{ matrix.arch }}-${{ steps.skia-info.outputs.tag }}
+
+      - name: Download & Extract Skia
+        if: steps.cache-skia.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          skia_url="${{ steps.skia-info.outputs.url }}"
+          skia_file=$(basename "$skia_url")
+          echo "Downloading Skia from: $skia_url"
+          curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
+          unzip -q "$skia_file" -d skia
+          rm -f "$skia_file"
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            SKIA_DIR=$(cygpath -m "$PWD/skia")
+            SKIA_LIB_DIR=$(cygpath -m "$PWD/skia/out/Release-x64")
+            SKIA_LIB="$SKIA_LIB_DIR/skia.lib"
+            EXTRA_FLAGS=""
+          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
+            SKIA_DIR=$(realpath skia)
+            SKIA_LIB_DIR=$(realpath skia/out/Release-arm64)
+            SKIA_LIB="$SKIA_LIB_DIR/libskia.a"
+            EXTRA_FLAGS="-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DPNG_ARM_NEON:STRING=on"
+          else
+            SKIA_DIR=$(realpath skia)
+            SKIA_LIB_DIR=$(realpath skia/out/Release-x64)
+            SKIA_LIB="$SKIA_LIB_DIR/libskia.a"
+            EXTRA_FLAGS="-DCMAKE_CXX_FLAGS:STRING=-stdlib=libstdc++ -DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libstdc++"
+          fi
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_UI=ON \
+            -DENABLE_SCRIPTING=ON \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR="$SKIA_DIR" \
+            -DSKIA_LIBRARY_DIR="$SKIA_LIB_DIR" \
+            -DSKIA_LIBRARY="$SKIA_LIB" \
+            $EXTRA_FLAGS
+
+      - name: Compile Aseprite
+        shell: bash
+        run: |
+          ninja -C build aseprite
+
+      - name: Package Binaries
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            cd build/bin
+            7z a -tzip "../../${{ matrix.archive_name }}" aseprite.exe data
+            cd ../..
+          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
+            cd build/bin
+            zip -r -y "../../${{ matrix.archive_name }}" Aseprite.app
+            cd ../..
+          else
+            cd build/bin
+            tar -czvf "../../${{ matrix.archive_name }}" aseprite data
+            cd ../..
+          fi
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}
+          path: ${{ matrix.archive_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Determine Release Tag
+        id: tag-info
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then
+            TAG="${{ inputs.release_tag }}"
+          elif [[ -n "${{ inputs.ref }}" ]]; then
+            TAG="${{ inputs.ref }}"
+          else
+            GIT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [[ -n "$GIT_TAG" ]]; then
+              TAG="${GIT_TAG}-build-$(date +'%Y%m%d%H%M')"
+            else
+              TAG="v$(date +'%Y.%m.%d-%H%M')"
+            fi
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag-info.outputs.tag }}
+          name: "Aseprite ${{ steps.tag-info.outputs.tag }}"
+          files: release-assets/*
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.prerelease || false }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
