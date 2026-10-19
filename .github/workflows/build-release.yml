@@ -60,6 +60,13 @@ jobs:
           submodules: 'recursive'
           fetch-depth: 0
 
+      - name: Restore helper scripts
+        shell: bash
+        run: |
+          if [ ! -d "misc/innosetup" ]; then
+            git checkout origin/main -- misc/innosetup 2>/dev/null || true
+          fi
+
       - name: Install Linux Dependencies
         if: runner.os == 'Linux'
         run: |
